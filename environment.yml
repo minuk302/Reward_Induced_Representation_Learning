@@ -1,0 +1,5 @@
+name: RIRL
+channels:
+  - conda-forge
+  - defaults
+prefix: /Users/minuk.lee/opt/anaconda3/envs/RIRL
