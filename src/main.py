@@ -5,6 +5,7 @@ import torch.optim as optim
 import torch_optimizer as optim_lookahead  # Ensure you have torch-optimizer installed
 import numpy as np
 import torch
+import wandb
 
 class ImageEncoder(torch.nn.Module):
     def __init__(self, input_channels, resolution, latent_dim):
@@ -35,9 +36,9 @@ class ImageEncoder(torch.nn.Module):
         return x
 
 
-class LSTMModel(torch.nn.Module):
+class RewardPredictionModel(torch.nn.Module):
     def __init__(self, latent_dim, prediction_count):
-        super(LSTMModel, self).__init__()
+        super(RewardPredictionModel, self).__init__()
         self.lstm = torch.nn.LSTM(input_size=latent_dim, hidden_size=latent_dim, batch_first=True)
         self.reward_head = torch.nn.Sequential(
             torch.nn.Linear(latent_dim, 32),
@@ -70,6 +71,11 @@ if __name__ == '__main__':
     image_latent_dimension = 64
     reward_specifier = 'zero'
     resolution = 64
+
+    wandb.init(
+        project="implementation_training",
+    )
+
     train_dataset = moving_sprites.MovingSpriteDataset(moving_sprites.AttrDict(
         resolution=resolution,
         max_seq_len=trajectory_length,
@@ -88,10 +94,10 @@ if __name__ == '__main__':
     )
     
     image_encoder = ImageEncoder(3, resolution, image_latent_dimension)
-    lstm_model = LSTMModel(image_latent_dimension, reward_prediction_count)
+    reward_prediction_model = RewardPredictionModel(image_latent_dimension, reward_prediction_count)
     
     optimizer = optim_lookahead.RAdam(
-    list(image_encoder.parameters()) + list(lstm_model.parameters()), 
+    list(image_encoder.parameters()) + list(reward_prediction_model.parameters()), 
     lr=0.001, betas=(0.9, 0.999))
     criterion = torch.nn.MSELoss()
 
@@ -104,11 +110,12 @@ if __name__ == '__main__':
                     continue
                 images_in_window = batch['images'][:,time:time+prior_count,:,:,:]
                 trajectory_image_latents = image_encoder(images_in_window.reshape(batch_size*prior_count, 3, resolution, resolution)).reshape(batch_size,prior_count,image_latent_dimension)
-                estimated_rewards = lstm_model(trajectory_image_latents)[:,:,-1]
+                estimated_rewards = reward_prediction_model(trajectory_image_latents)[:,:,-1]
                 target_rewards = batch['rewards'][reward_specifier][:, time:time+reward_prediction_count]
 
                 loss = criterion(estimated_rewards, target_rewards)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                print(loss)
+                wandb.log({"representaiton_model_loss": loss})
+    wandb.finish()

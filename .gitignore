@@ -3,3 +3,4 @@ results
 *.egg-info
 *.pyc
 .DS_Store
+wandb
