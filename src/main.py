@@ -87,13 +87,18 @@ class RewardPredictionModel(torch.nn.Module):
         return torch.stack(predictions, dim=1)
 
 def generate_dataset_spec(params):
+    rewards = []
+    if params['reward_specifier'] == 'vertical_position':
+        rewards = [sprites_rewards.VertPosReward]
+    elif params['reward_specifier'] == 'horizontal_position':
+        rewards = [sprites_rewards.HorPosReward]
     return moving_sprites.AttrDict(
         resolution=params['resolution'],
         max_seq_len=params['trajectory_length'],
         max_speed=0.05,      # total image range [0, 1]
         obj_size=0.2,       # size of objects, full images is 1.0
         shapes_per_traj=1,      # number of shapes per trajectory
-        rewards=[sprites_rewards.VertPosReward],
+        rewards=rewards,
     )
 
 def generate_dataloader(params):
@@ -111,8 +116,9 @@ def create_image_decoder_representation(encoder, params, is_train, is_load, wand
     train_loader = generate_dataloader(params)
 
     decoder = ImageDecoder()
+    version_name = params['version_name']
     if is_load == True:
-        decoder.load_state_dict(torch.load(f'image_decoder.pth'))
+        decoder.load_state_dict(torch.load(f'image_decoder_{version_name}.pth'))
     if is_train == False:
         return decoder
 
@@ -120,32 +126,33 @@ def create_image_decoder_representation(encoder, params, is_train, is_load, wand
     criterion = torch.nn.MSELoss()
     for epoch in range(1):
         for idx, batch in enumerate(train_loader):
-            for time in range(params['trajectory_length']):
-                if time < params['prior_count']:
-                    continue
-                if time > params['trajectory_length'] - params['reward_prediction_count']:
-                    continue
-                images_in_window = batch['images'][:,time-params['prior_count']:time,:,:,:]
-                image_encode, _ = encoder(images_in_window.reshape(params['batch_size']*params['prior_count'], 1, params['resolution'], params['resolution']))
-                estimated_image = decoder(image_encode)
-                estimated_image = estimated_image.reshape(params['batch_size'],params['prior_count'],1, params['resolution'], params['resolution'])
+            images_in_window = batch['images'][:, 0::4, :, :, :]
+            training_length = images_in_window.shape[1]
+            image_encode, _ = encoder(images_in_window.reshape(params['batch_size']*training_length, 1, params['resolution'], params['resolution']))
+            estimated_image = decoder(image_encode)
+            estimated_image = estimated_image.reshape(params['batch_size'],training_length,1, params['resolution'], params['resolution'])
 
-                loss = criterion(estimated_image, images_in_window)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                wandb.log({f"image_reproduce_loss": loss})
+            loss = criterion(estimated_image, images_in_window)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            wandb.log({f"image_reproduce_loss": loss})
 
-            if idx % 20 == 0:
-                torch.save(decoder.state_dict(), f'image_decoder.pth')
+            if idx % params['training_save_index'] == 0:
+                print(idx)
+                torch.save(decoder.state_dict(), f'image_decoder_{version_name}.pth')
+                create_image(encoder, decoder, version_name)
+                if idx == params['training_finishing_index']:
+                    return decoder
     return decoder
 
 def create_model(params, is_train, is_load, wandb):
     image_encoder = ImageEncoder(1, params['resolution'], params['image_latent_dimension'])
     reward_prediction_model = RewardPredictionModel(params['image_latent_dimension'], params['reward_prediction_count'])
+    version_name = params['version_name']
     if is_load == True:
-        image_encoder.load_state_dict(torch.load('image_encoder.pth'))
-        reward_prediction_model.load_state_dict(torch.load('reward_prediction_model.pth'))
+        image_encoder.load_state_dict(torch.load(f'image_encoder_{version_name}.pth'))
+        reward_prediction_model.load_state_dict(torch.load(f'reward_prediction_model_{version_name}.pth'))
     if is_train == False:
         return image_encoder, reward_prediction_model
     
@@ -157,7 +164,7 @@ def create_model(params, is_train, is_load, wandb):
     train_loader = generate_dataloader(params)
     for epoch in range(1):
         for idx, batch in enumerate(train_loader):
-            for time in range(params['trajectory_length']):
+            for time in range(0, params['trajectory_length'], params['prior_count']):
                 if time < params['prior_count']:
                     continue
                 if time > params['trajectory_length'] - params['reward_prediction_count']:
@@ -172,33 +179,20 @@ def create_model(params, is_train, is_load, wandb):
                 loss.backward()
                 optimizer.step()
                 wandb.log({"representaiton_model_loss": loss})
-            if idx % 20 == 0:
+            if idx % params['training_save_index'] == 0:
                 print(idx)
-                torch.save(image_encoder.state_dict(), f'image_encoder.pth')
-                torch.save(reward_prediction_model.state_dict(), f'reward_prediction_model.pth')
+                torch.save(image_encoder.state_dict(), f'image_encoder_{version_name}.pth')
+                torch.save(reward_prediction_model.state_dict(), f'reward_prediction_model_{version_name}.pth')
+                if idx == params['training_finishing_index']:
+                    return image_encoder, reward_prediction_model
     return image_encoder, reward_prediction_model
 
-if __name__ == '__main__':
-    # wandb.init(
-    #    project="implementation_training",
-    # )
-    params = {
-        'batch_size': 32,
-        'trajectory_length': 30,
-        'prior_count': 3,
-        'reward_prediction_count': 10,
-        'image_latent_dimension': 64,
-        'reward_specifier': 'vertical_position',
-        'resolution': 64,
-    }
-    image_encoder, reward_prediction_model = create_model(params, False, True, wandb)
-    image_decoder = create_image_decoder_representation(image_encoder, params, False, True, wandb)
-
+def create_image(image_encoder, image_decoder, version_name):
     seq_generator = moving_sprites.TemplateMovingSpritesGenerator(generate_dataset_spec(params))
     traj = seq_generator.gen_trajectory()
     images = traj.images[:, None].repeat(3, axis=1).astype(np.float32)
     img = make_image_seq_strip([images[None, :]], sep_val=255.0).astype(np.uint8)
-    cv2.imwrite("original.png", img[0].transpose(1, 2, 0))
+    cv2.imwrite(f"original_{version_name}.png", img[0].transpose(1, 2, 0))
 
     images_to_input_model = torch.from_numpy(traj.images[:, None].repeat(1, axis=1).astype(np.float32) / (255./2) - 1.0)
     images_encoded, _ = image_encoder(images_to_input_model)
@@ -207,4 +201,36 @@ if __name__ == '__main__':
     images_decoded = ((images_decoded + 1.0) * (255./2)).detach().numpy()
     images_decoded = images_decoded.repeat(3, axis=1).astype(np.float32)
     decoded_img = make_image_seq_strip([images_decoded[None, :]], sep_val=255.0).astype(np.uint8)
-    cv2.imwrite("estimated.png", decoded_img[0].transpose(1, 2, 0))
+    cv2.imwrite(f"estimated_{version_name}.png", decoded_img[0].transpose(1, 2, 0))
+
+if __name__ == '__main__':
+    wandb.init(
+       project="implementation_training",
+    )
+
+    params = {
+        'train_representation': False,
+    }
+
+    params_representation = {
+        'batch_size': 256,
+        'version_name': 'vertical_2',
+        'trajectory_length': 50,
+        'prior_count': 3,
+        'reward_prediction_count': 25,
+        'image_latent_dimension': 64,
+        'reward_specifier': 'vertical_position',
+        'resolution': 64,
+        'training_save_index': 20,
+        'training_finishing_index': 10000,
+    }
+    if params['train_representation'] == True:
+        version_name = params_representation['version_name']
+        print(params_representation['version_name'])
+        image_encoder, reward_prediction_model = create_model(params_representation, True, True, wandb)
+        #image_decoder = create_image_decoder_representation(image_encoder, params, True, False, wandb)
+    else:
+        image_encoder, reward_prediction_model = create_model(params_representation, False, True, wandb)
+
+    
+    

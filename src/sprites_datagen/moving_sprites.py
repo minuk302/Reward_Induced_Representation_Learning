@@ -14,7 +14,7 @@ class MovingSpriteDataset(Dataset):
         self._generator = TemplateMovingSpritesGenerator(self._spec)
 
     def __len__(self):
-        return 100000
+        return 1000000
 
     def __getitem__(self, item):
         traj = self._generator.gen_trajectory()
