@@ -11,7 +11,7 @@ class MovingSpriteDataset(Dataset):
     """Dataset of multiple sprites bouncing in frame, contains different reward annotations."""
     def __init__(self, spec):
         self._spec = spec
-        self._generator = TemplateMovingSpritesGenerator(self._spec)
+        self._generator = DistractorTemplateMovingSpritesGenerator(self._spec)
 
     def __len__(self):
         return 1000000
@@ -127,10 +127,10 @@ if __name__ == '__main__':
         max_seq_len=30,
         max_speed=0.05,      # total image range [0, 1]
         obj_size=0.2,       # size of objects, full images is 1.0
-        shapes_per_traj=1,      # number of shapes per trajectory
+        shapes_per_traj=3,      # number of shapes per trajectory
         rewards=[ZeroReward],
     )
-    gen = TemplateMovingSpritesGenerator(spec)
+    gen = DistractorTemplateMovingSpritesGenerator(spec)
     traj = gen.gen_trajectory()
     img = make_image_seq_strip([traj.images[None, :, None].repeat(3, axis=2).astype(np.float32)], sep_val=255.0).astype(np.uint8)
     cv2.imwrite("test.png", img[0].transpose(1, 2, 0))

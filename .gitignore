@@ -4,3 +4,5 @@ results
 *.pyc
 .DS_Store
 wandb
+*.png
+*.pth

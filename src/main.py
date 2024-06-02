@@ -48,7 +48,7 @@ class ImageEncoder(torch.nn.Module):
     def forward(self, x):
         for layer in self.conv_layers:
             x = torch.nn.functional.relu(layer(x))
-        image_encode = x.detach().clone()
+        image_encode = x.clone()
         x = x.view(x.size(0), -1)
         x = self.fc_layer(x)
         return image_encode, x
@@ -75,17 +75,20 @@ class ImageDecoder(torch.nn.Module):
         return self.decoder(x)
 
 class RewardPredictionModel(torch.nn.Module):
-    def __init__(self, latent_dim, prediction_count):
+    def __init__(self, latent_dim, prediction_count, num_heads):
         super(RewardPredictionModel, self).__init__()
         self.lstm = torch.nn.LSTM(input_size=latent_dim, hidden_size=latent_dim, batch_first=True)
-        self.reward_head = torch.nn.Sequential(
-            torch.nn.Linear(latent_dim, 32),
-            torch.nn.ReLU(),
-            torch.nn.Linear(32, 32),
-            torch.nn.ReLU(),
-            torch.nn.Linear(32, 1)
-        )
+        self.reward_heads = torch.nn.ModuleList([
+            torch.nn.Sequential(
+                torch.nn.Linear(latent_dim, 32),
+                torch.nn.ReLU(),
+                torch.nn.Linear(32, 32),
+                torch.nn.ReLU(),
+                torch.nn.Linear(32, 1)
+            ) for _ in range(num_heads)
+        ])
         self.prediction_count = prediction_count
+        self.num_heads = num_heads
 
     def forward(self, x):
         h = torch.zeros(1, x.size(0), self.lstm.hidden_size).to(x.device)
@@ -96,32 +99,33 @@ class RewardPredictionModel(torch.nn.Module):
         last_output = outputs[:, -1, :]  # Get the last output from the LSTM
         for i in range(self.prediction_count):
             outputs, (h, c) = self.lstm(last_output.unsqueeze(1), (h, c))  # Input the last output back into the LSTM
-            prediction = self.reward_head(h[-1, :, :])
-            predictions.append(prediction)
-            last_output = outputs[:,-1,:]  # Use the prediction as the next input
+            head_predictions = [reward_head(h[-1, :, :]) for reward_head in self.reward_heads]
+            predictions.append(torch.cat(head_predictions, dim=1))
+            last_output = outputs[:,-1,:]
         return torch.stack(predictions, dim=1)
 
 def generate_dataset_spec(params):
     rewards = []
-    if 'vertical_position' in params['reward_specifier']:
-        rewards.appends(sprites_rewards.VertPosReward)
-    if 'horizontal_position' in params['reward_specifier']:
-        rewards.appends(sprites_rewards.HorPosReward)
-    if 'agent_x' in params['reward_specifier']:
-        rewards.appends(sprites_rewards.AgentXReward)
-    if 'agent_y' in params['reward_specifier']:
-        rewards.appends(sprites_rewards.AgentYReward)
-    if 'target_x' in params['reward_specifier']:
-        rewards.appends(sprites_rewards.TargetXReward)
-    if 'target_y' in params['reward_specifier']:
-        rewards.appends(sprites_rewards.TargetYReward)
+    for specifier in params['reward_specifier']:
+        if 'vertical_position' == specifier:
+            rewards.append(sprites_rewards.VertPosReward)
+        if 'horizontal_position' == specifier:
+            rewards.append(sprites_rewards.HorPosReward)
+        if 'agent_x' == specifier:
+            rewards.append(sprites_rewards.AgentXReward)
+        if 'agent_y' == specifier:
+            rewards.append(sprites_rewards.AgentYReward)
+        if 'target_x' == specifier:
+            rewards.append(sprites_rewards.TargetXReward)
+        if 'target_y' == specifier:
+            rewards.append(sprites_rewards.TargetYReward)
     
     return moving_sprites.AttrDict(
         resolution=params['resolution'],
         max_seq_len=params['trajectory_length'],
         max_speed=0.05,      # total image range [0, 1]
         obj_size=0.2,       # size of objects, full images is 1.0
-        shapes_per_traj=1,      # number of shapes per trajectory
+        shapes_per_traj=3,      # number of shapes per trajectory
         rewards=rewards,
     )
 
@@ -172,7 +176,7 @@ def create_image_decoder_representation(encoder, params, is_train, is_load):
 
 def create_model(params, is_train, is_load):
     image_encoder = ImageEncoder(1, params['resolution'], params['image_latent_dimension'])
-    reward_prediction_model = RewardPredictionModel(params['image_latent_dimension'], params['reward_prediction_count'])
+    reward_prediction_model = RewardPredictionModel(params['image_latent_dimension'], params['reward_prediction_count'], len(params['reward_specifier']))
     version_name = params['version_name']
     if is_load == True:
         image_encoder.load_state_dict(torch.load(f'image_encoder_{version_name}.pth'))
@@ -195,9 +199,13 @@ def create_model(params, is_train, is_load):
                     continue
                 images_in_window = batch['images'][:,time-params['prior_count']:time,:,:,:]
                 _, trajectory_image_latents = image_encoder(images_in_window.reshape(params['batch_size']*params['prior_count'], 1, params['resolution'], params['resolution']))
-                estimated_rewards = reward_prediction_model(trajectory_image_latents.reshape(params['batch_size'],params['prior_count'],params['image_latent_dimension']))[:,:,-1]
+                estimated_rewards = reward_prediction_model(trajectory_image_latents.reshape(params['batch_size'],params['prior_count'],params['image_latent_dimension']))
 
-                target_rewards = batch['rewards'][params['reward_specifier']][:, time:time+params['reward_prediction_count']]
+                target_rewards = []
+                for specifier in params['reward_specifier']:
+                    reward_slice = batch['rewards'][specifier][:, time:time+params['reward_prediction_count']]
+                    target_rewards.append(reward_slice)
+                target_rewards = torch.stack(target_rewards, dim=2)
 
                 loss = criterion(estimated_rewards, target_rewards)
                 optimizer.zero_grad()
@@ -288,7 +296,7 @@ class Actor(nn.Module):
 if __name__ == '__main__':
     params = {
         'is_oracle_setup': False,
-        'use_representation': False,
+        'use_representation': True,
         'batch_size': 32,
         'num_episodes': 10000,
         'seed': 1,
@@ -301,21 +309,22 @@ if __name__ == '__main__':
     if params['use_representation'] == True:
         params_representation = {
             'batch_size': 256,
-            'version_name': 'vertical_2',
+            'version_name': 'one_distractor',
             'trajectory_length': 50,
             'prior_count': 3,
             'reward_prediction_count': 25,
             'image_latent_dimension': 64,
             'reward_specifier': ['agent_x','agent_y','target_x','target_y'],
             'resolution': 64,
-            'training_save_index': 20,
+            'training_save_index': 50,
             'training_finishing_index': 10000,
         }
         version_name = params_representation['version_name']
         print(params_representation['version_name'])
         image_encoder, reward_prediction_model = create_model(params_representation, True, True)
         #image_decoder = create_image_decoder_representation(image_encoder, params, True, False)
-
+    
+    #learning representation now
     data_spec = moving_sprites.AttrDict(
         resolution=64,
         max_ep_len=40,
@@ -326,11 +335,12 @@ if __name__ == '__main__':
 
     if params['is_oracle_setup'] == True:
         env = SpritesStateEnv()
+        state_dim = env.observation_space.shape[0]
     else:
         env = SpritesEnv()
+        state_dim = 128 # with CNN, we get 1x64x64 -> 4x32x32 -> ... -> 128 x 1 x 1 latent variable. I will flatten and put in.
     env.set_config(data_spec)
 
-    state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     actor = Actor(state_dim, action_dim)
     qf1 = SoftQNetwork(state_dim, action_dim)
