@@ -8,6 +8,21 @@ import torch
 import cv2
 import wandb
 from src.general_utils import make_image_seq_strip
+from src.sprites_env.envs.sprites import SpritesEnv, SpritesStateEnv
+import random
+from dataclasses import dataclass
+import gymnasium as gym
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import collections
+
+def log(log_dict):
+    if wandb.run is None:
+        wandb.init(project="implementation_training",)
+    wandb.log(log_dict)
 
 class ImageEncoder(torch.nn.Module):
     def __init__(self, input_channels, resolution, latent_dim):
@@ -88,10 +103,19 @@ class RewardPredictionModel(torch.nn.Module):
 
 def generate_dataset_spec(params):
     rewards = []
-    if params['reward_specifier'] == 'vertical_position':
-        rewards = [sprites_rewards.VertPosReward]
-    elif params['reward_specifier'] == 'horizontal_position':
-        rewards = [sprites_rewards.HorPosReward]
+    if 'vertical_position' in params['reward_specifier']:
+        rewards.appends(sprites_rewards.VertPosReward)
+    if 'horizontal_position' in params['reward_specifier']:
+        rewards.appends(sprites_rewards.HorPosReward)
+    if 'agent_x' in params['reward_specifier']:
+        rewards.appends(sprites_rewards.AgentXReward)
+    if 'agent_y' in params['reward_specifier']:
+        rewards.appends(sprites_rewards.AgentYReward)
+    if 'target_x' in params['reward_specifier']:
+        rewards.appends(sprites_rewards.TargetXReward)
+    if 'target_y' in params['reward_specifier']:
+        rewards.appends(sprites_rewards.TargetYReward)
+    
     return moving_sprites.AttrDict(
         resolution=params['resolution'],
         max_seq_len=params['trajectory_length'],
@@ -111,7 +135,7 @@ def generate_dataloader(params):
         drop_last=True,
     )
 
-def create_image_decoder_representation(encoder, params, is_train, is_load, wandb):
+def create_image_decoder_representation(encoder, params, is_train, is_load):
     encoder.eval()
     train_loader = generate_dataloader(params)
 
@@ -136,7 +160,7 @@ def create_image_decoder_representation(encoder, params, is_train, is_load, wand
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            wandb.log({f"image_reproduce_loss": loss})
+            log({f"image_reproduce_loss": loss})
 
             if idx % params['training_save_index'] == 0:
                 print(idx)
@@ -146,7 +170,7 @@ def create_image_decoder_representation(encoder, params, is_train, is_load, wand
                     return decoder
     return decoder
 
-def create_model(params, is_train, is_load, wandb):
+def create_model(params, is_train, is_load):
     image_encoder = ImageEncoder(1, params['resolution'], params['image_latent_dimension'])
     reward_prediction_model = RewardPredictionModel(params['image_latent_dimension'], params['reward_prediction_count'])
     version_name = params['version_name']
@@ -172,13 +196,14 @@ def create_model(params, is_train, is_load, wandb):
                 images_in_window = batch['images'][:,time-params['prior_count']:time,:,:,:]
                 _, trajectory_image_latents = image_encoder(images_in_window.reshape(params['batch_size']*params['prior_count'], 1, params['resolution'], params['resolution']))
                 estimated_rewards = reward_prediction_model(trajectory_image_latents.reshape(params['batch_size'],params['prior_count'],params['image_latent_dimension']))[:,:,-1]
+
                 target_rewards = batch['rewards'][params['reward_specifier']][:, time:time+params['reward_prediction_count']]
 
                 loss = criterion(estimated_rewards, target_rewards)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                wandb.log({"representaiton_model_loss": loss})
+                log({"representaiton_model_loss": loss})
             if idx % params['training_save_index'] == 0:
                 print(idx)
                 torch.save(image_encoder.state_dict(), f'image_encoder_{version_name}.pth')
@@ -203,34 +228,195 @@ def create_image(image_encoder, image_decoder, version_name):
     decoded_img = make_image_seq_strip([images_decoded[None, :]], sep_val=255.0).astype(np.uint8)
     cv2.imwrite(f"estimated_{version_name}.png", decoded_img[0].transpose(1, 2, 0))
 
+
+LOG_STD_MAX = 2
+LOG_STD_MIN = -5
+
+class SoftQNetwork(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(state_dim + action_dim, 256)
+        self.fc2 = nn.Linear(256, 256)
+        self.fc3 = nn.Linear(256, 1)
+
+    def forward(self, x, a):
+        x = torch.cat([x, a], 1)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+class Actor(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(state_dim, 256)
+        self.fc2 = nn.Linear(256, 256)
+        self.fc_mean = nn.Linear(256, action_dim)
+        self.fc_logstd = nn.Linear(256, action_dim)
+        # action rescaling
+        self.register_buffer(
+            "action_scale", torch.tensor(((1.0) - (-1.0)) / 2.0, dtype=torch.float32)
+        )
+        self.register_buffer(
+            "action_bias", torch.tensor(((1.0) + (-1.0)) / 2.0, dtype=torch.float32)
+        )
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        mean = self.fc_mean(x)
+        log_std = self.fc_logstd(x)
+        log_std = torch.tanh(log_std)
+        log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)  # From SpinUp / Denis Yarats
+
+        return mean, log_std
+
+    def get_action(self, x):
+        mean, log_std = self(x)
+        std = log_std.exp()
+        normal = torch.distributions.Normal(mean, std)
+        x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))
+        y_t = torch.tanh(x_t)
+        action = y_t * self.action_scale + self.action_bias
+        log_prob = normal.log_prob(x_t)
+        # Enforcing Action Bound
+        log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
+        log_prob = log_prob.sum().unsqueeze(dim=-1)
+        mean = torch.tanh(mean) * self.action_scale + self.action_bias
+        return action, log_prob, mean
+
 if __name__ == '__main__':
-    wandb.init(
-       project="implementation_training",
-    )
-
     params = {
-        'train_representation': False,
+        'is_oracle_setup': False,
+        'use_representation': False,
+        'batch_size': 32,
+        'num_episodes': 10000,
+        'seed': 1,
+        'tau': 0.05,
+        'gamma': 0.9,
+        'q_lr': 1e-3,
+        'actor_lr': 1e-3,
     }
 
-    params_representation = {
-        'batch_size': 256,
-        'version_name': 'vertical_2',
-        'trajectory_length': 50,
-        'prior_count': 3,
-        'reward_prediction_count': 25,
-        'image_latent_dimension': 64,
-        'reward_specifier': 'vertical_position',
-        'resolution': 64,
-        'training_save_index': 20,
-        'training_finishing_index': 10000,
-    }
-    if params['train_representation'] == True:
+    if params['use_representation'] == True:
+        params_representation = {
+            'batch_size': 256,
+            'version_name': 'vertical_2',
+            'trajectory_length': 50,
+            'prior_count': 3,
+            'reward_prediction_count': 25,
+            'image_latent_dimension': 64,
+            'reward_specifier': ['agent_x','agent_y','target_x','target_y'],
+            'resolution': 64,
+            'training_save_index': 20,
+            'training_finishing_index': 10000,
+        }
         version_name = params_representation['version_name']
         print(params_representation['version_name'])
-        image_encoder, reward_prediction_model = create_model(params_representation, True, True, wandb)
-        #image_decoder = create_image_decoder_representation(image_encoder, params, True, False, wandb)
-    else:
-        image_encoder, reward_prediction_model = create_model(params_representation, False, True, wandb)
+        image_encoder, reward_prediction_model = create_model(params_representation, True, True)
+        #image_decoder = create_image_decoder_representation(image_encoder, params, True, False)
 
-    
-    
+    data_spec = moving_sprites.AttrDict(
+        resolution=64,
+        max_ep_len=40,
+        max_speed=0.1,      # total image range [0, 1]
+        obj_size=0.2,       # size of objects, full images is 1.0
+        follow=True,
+    )
+
+    if params['is_oracle_setup'] == True:
+        env = SpritesStateEnv()
+    else:
+        env = SpritesEnv()
+    env.set_config(data_spec)
+
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    actor = Actor(state_dim, action_dim)
+    qf1 = SoftQNetwork(state_dim, action_dim)
+    qf2 = SoftQNetwork(state_dim, action_dim)
+    qf1_target = SoftQNetwork(state_dim, action_dim)
+    qf2_target = SoftQNetwork(state_dim, action_dim)
+    qf1_target.load_state_dict(qf1.state_dict())
+    qf2_target.load_state_dict(qf2.state_dict())
+    q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=params['q_lr'])
+    actor_optimizer = optim.Adam(list(actor.parameters()), lr=params['actor_lr'])
+    replay_buffer = collections.deque(maxlen=1000000)
+
+    target_entropy = -torch.prod(torch.Tensor(env.observation_space.shape)).item()
+    log_alpha = torch.zeros(1, requires_grad=True)
+    alpha = log_alpha.exp().item()
+    a_optimizer = optim.Adam([log_alpha], lr=3e-4)
+
+    for episode in range(params['num_episodes']):
+        obs = env.reset()
+        termination = False
+        total_reward = 0
+        while not termination:
+            action, _, _ = actor.get_action(torch.Tensor(obs))
+            #action = torch.Tensor(env.action_space.sample())
+
+            action = action.detach().cpu().numpy()
+            next_obs, reward, termination, info = env.step(action)
+            real_next_obs = next_obs.copy()
+            replay_buffer.append((obs, real_next_obs, action, reward, termination, info))
+
+            if len(replay_buffer) > params['batch_size']:
+                minibatch = random.sample(replay_buffer, params['batch_size'])
+                rb_obs, rb_next_obs, rb_actions, rb_rewards, rb_terminations, rb_infos = zip(*minibatch)
+                rb_obs_tensor = torch.Tensor(rb_obs)
+                rb_next_obs_tensor = torch.Tensor(rb_next_obs)
+                rb_actions_tensor = torch.Tensor(rb_actions)
+                rb_rewards_tensor = torch.Tensor(rb_rewards)
+                rb_terminations_tensor = torch.Tensor(rb_terminations)
+                with torch.no_grad():
+                    next_state_actions, next_state_log_pis, _ = actor.get_action(rb_next_obs_tensor)
+                    qf1_next_target = qf1_target(rb_next_obs_tensor, next_state_actions)
+                    qf2_next_target = qf2_target(rb_next_obs_tensor, next_state_actions)
+                    min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pis
+                    next_q_value = rb_rewards_tensor.flatten() + (1 - rb_terminations_tensor.flatten()) * params['gamma'] * (min_qf_next_target).view(-1)
+
+                qf1_a_values = qf1(rb_obs_tensor, rb_actions_tensor).view(-1)
+                qf2_a_values = qf2(rb_obs_tensor, rb_actions_tensor).view(-1)
+                qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
+                qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
+                qf_loss = qf1_loss + qf2_loss
+
+                # optimize the model
+                q_optimizer.zero_grad()
+                qf_loss.backward()
+                q_optimizer.step()
+
+                pi, log_pi, _ = actor.get_action(rb_obs_tensor)
+                qf1_pi = qf1(rb_obs_tensor, pi)
+                qf2_pi = qf2(rb_obs_tensor, pi)
+                min_qf_pi = torch.min(qf1_pi, qf2_pi)
+                actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
+
+                actor_optimizer.zero_grad()
+                actor_loss.backward()
+                actor_optimizer.step()
+
+                for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
+                    target_param.data.copy_(params['tau'] * param.data + (1 - params['tau']) * target_param.data)
+                for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
+                    target_param.data.copy_(params['tau'] * param.data + (1 - params['tau']) * target_param.data)
+
+                with torch.no_grad():
+                    _, log_pi, _ = actor.get_action(rb_obs_tensor)
+                alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
+                a_optimizer.zero_grad()
+                alpha_loss.backward()
+                a_optimizer.step()
+                alpha = log_alpha.exp().item()
+
+                log({'qf_loss': qf_loss})
+                log({'actor_loss': actor_loss})
+                q_target_value_log = float(next_q_value.numpy()[0])
+                log({'min_q_value': q_target_value_log})
+                log({'alpha': alpha})
+                log({'alpha_loss': alpha_loss})
+            obs = next_obs
+            total_reward += reward
+            log({'reward': reward})
+        log({'episodic_reward': total_reward})
