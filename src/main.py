@@ -297,8 +297,8 @@ if __name__ == '__main__':
     # change generate_dataset_spec, shapes per traj = 3 (when training representation). currently have 3 so no need!
     # change sprites.py self.n_distractors = kwarg['n_distractors'] if kwarg else 1 part to 0.
     params = {
-        'is_oracle_setup': False,
-        'image_scratch': True,
+        'is_oracle_setup': True,
+        'image_scratch': False,
         'batch_size': 32,
         'num_episodes': 100000,
         'seed': 1,
@@ -310,6 +310,21 @@ if __name__ == '__main__':
         'env_max_speed' : 0.1,
         'distractor': 0,
     }
+
+    # params = {
+    #     'is_oracle_setup': False,
+    #     'image_scratch': False,
+    #     'batch_size': 256,
+    #     'num_episodes': 100000,
+    #     'seed': 1,
+    #     'tau': 0.05,
+    #     'gamma': 0.95,
+    #     'q_lr': 3e-4,
+    #     'actor_lr': 3e-4,
+    #     'env_ep_length' : 50,
+    #     'env_max_speed' : 0.1,
+    #     'distractor': 0,
+    # }
 
     if params['distractor'] == 0:
         version_name = 'zero_distractor'
@@ -453,19 +468,18 @@ if __name__ == '__main__':
                     rb_actions_tensor = torch.Tensor(rb_actions).to(device)
                     rb_rewards_tensor = torch.Tensor(rb_rewards).to(device)
                     rb_terminations_tensor = torch.Tensor(rb_terminations).to(device)
+                    rb_obs_tensor = torch.Tensor(rb_obs).to(device)
+                    rb_next_obs_tensor = torch.Tensor(rb_next_obs).to(device)
 
-                    rb_obs_critic_encoded_tensor = image_encoder_critic(torch.Tensor(rb_obs).to(device).unsqueeze(1))[0].squeeze()
-                    rb_next_obs_critic_encoded_tensor = image_encoder_critic(torch.Tensor(rb_next_obs).to(device).unsqueeze(1))[0].squeeze()
-                    rb_next_obs_actor_encoded_tensor = image_encoder_actor(torch.Tensor(rb_next_obs).to(device).unsqueeze(1))[0].squeeze()
                     with torch.no_grad():
-                        next_state_actions, next_state_log_pis, _ = actor.get_action(rb_next_obs_actor_encoded_tensor)
-                        qf1_next_target = qf1_target(rb_next_obs_critic_encoded_tensor, next_state_actions)
-                        qf2_next_target = qf2_target(rb_next_obs_critic_encoded_tensor, next_state_actions)
+                        next_state_actions, next_state_log_pis, _ = actor.get_action(image_encoder_actor(rb_next_obs_tensor.unsqueeze(1))[0].squeeze())
+                        qf1_next_target = qf1_target(image_encoder_critic(rb_next_obs_tensor.unsqueeze(1))[0].squeeze(), next_state_actions)
+                        qf2_next_target = qf2_target(image_encoder_critic(rb_next_obs_tensor.unsqueeze(1))[0].squeeze(), next_state_actions)
                         min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pis
                         next_q_value = rb_rewards_tensor.flatten() + (1 - rb_terminations_tensor.flatten()) * params['gamma'] * (min_qf_next_target).view(-1)
 
-                    qf1_a_values = qf1(rb_obs_critic_encoded_tensor, rb_actions_tensor).view(-1)
-                    qf2_a_values = qf2(rb_obs_critic_encoded_tensor, rb_actions_tensor).view(-1)
+                    qf1_a_values = qf1(image_encoder_critic(rb_obs_tensor.unsqueeze(1))[0].squeeze(), rb_actions_tensor).view(-1)
+                    qf2_a_values = qf2(image_encoder_critic(rb_obs_tensor.unsqueeze(1))[0].squeeze(), rb_actions_tensor).view(-1)
                     qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
                     qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
                     qf_loss = qf1_loss + qf2_loss
@@ -474,11 +488,9 @@ if __name__ == '__main__':
                     qf_loss.backward()
                     q_optimizer.step()
 
-                    rb_obs_critic_encoded_tensor = image_encoder_critic(torch.Tensor(rb_obs).to(device).unsqueeze(1))[0].squeeze()
-                    rb_obs_actor_encoded_tensor = image_encoder_actor(torch.Tensor(rb_obs).to(device).unsqueeze(1))[0].squeeze()
-                    pi, log_pi, _ = actor.get_action(rb_obs_actor_encoded_tensor)
-                    qf1_pi = qf1(rb_obs_critic_encoded_tensor, pi)
-                    qf2_pi = qf2(rb_obs_critic_encoded_tensor, pi)
+                    pi, log_pi, _ = actor.get_action(image_encoder_actor(rb_obs_tensor.unsqueeze(1))[0].squeeze())
+                    qf1_pi = qf1(image_encoder_critic(rb_obs_tensor.unsqueeze(1))[0].squeeze(), pi)
+                    qf2_pi = qf2(image_encoder_critic(rb_obs_tensor.unsqueeze(1))[0].squeeze(), pi)
                     min_qf_pi = torch.min(qf1_pi, qf2_pi)
                     actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
 
@@ -492,7 +504,7 @@ if __name__ == '__main__':
                         target_param.data.copy_(params['tau'] * param.data + (1 - params['tau']) * target_param.data)
 
                     with torch.no_grad():
-                        _, log_pi, _ = actor.get_action(rb_obs_actor_encoded_tensor)
+                        _, log_pi, _ = actor.get_action(image_encoder_actor(rb_obs_tensor.unsqueeze(1))[0].squeeze())
                     alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
                     a_optimizer.zero_grad()
                     alpha_loss.backward()
