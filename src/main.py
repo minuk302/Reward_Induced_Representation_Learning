@@ -16,6 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import collections
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def log(log_dict):
     if wandb.run is None:
@@ -133,7 +134,7 @@ def generate_dataloader(params):
         dataset,
         batch_size=params['batch_size'],
         shuffle=False,
-        num_workers=4,
+        num_workers=16,
         drop_last=True,
     )
 
@@ -141,7 +142,7 @@ def create_image_decoder_representation(encoder, params, is_train, is_load):
     encoder.eval()
     train_loader = generate_dataloader(params)
 
-    decoder = ImageDecoder()
+    decoder = ImageDecoder().to(device)
     version_name = params['version_name']
     if is_load == True:
         decoder.load_state_dict(torch.load(f'image_decoder_{version_name}.pth'))
@@ -173,8 +174,8 @@ def create_image_decoder_representation(encoder, params, is_train, is_load):
     return decoder
 
 def create_model(params, is_train, is_load):
-    image_encoder = ImageEncoder(1, params['resolution'], params['image_latent_dimension'])
-    reward_prediction_model = RewardPredictionModel(params['image_latent_dimension'], params['reward_prediction_count'], len(params['reward_specifier']))
+    image_encoder = ImageEncoder(1, params['resolution'], params['image_latent_dimension']).to(device)
+    reward_prediction_model = RewardPredictionModel(params['image_latent_dimension'], params['reward_prediction_count'], len(params['reward_specifier'])).to(device)
     version_name = params['version_name']
     if is_load == True:
         image_encoder.load_state_dict(torch.load(f'image_encoder_{version_name}.pth'))
@@ -307,12 +308,18 @@ if __name__ == '__main__':
         'actor_lr': 1e-3,
         'env_ep_length' : 50,
         'env_max_speed' : 0.1,
+        'distractor': 0,
     }
+
+    if params['distractor'] == 0:
+        version_name = 'zero_distractor'
+    elif params['distractor'] == 1:
+        version_name = 'one_distractor'
 
     if params['is_oracle_setup'] == False:
         params_representation = {
             'batch_size': 256,
-            'version_name': 'zero_distractor',
+            'version_name': version_name,
             'trajectory_length': params['env_ep_length'],
             'max_speed': params['env_max_speed'],
             'prior_count': 3,
@@ -324,8 +331,8 @@ if __name__ == '__main__':
             'training_finishing_index': 10000,
         }
         if params['image_scratch'] == True:
-            image_encoder_critic = ImageEncoder(1, params_representation['resolution'], params_representation['image_latent_dimension'])
-            image_encoder_actor = ImageEncoder(1, params_representation['resolution'], params_representation['image_latent_dimension'])
+            image_encoder_critic = ImageEncoder(1, params_representation['resolution'], params_representation['image_latent_dimension']).to(device)
+            image_encoder_actor = ImageEncoder(1, params_representation['resolution'], params_representation['image_latent_dimension']).to(device)
         else:
             image_encoder_critic, reward_prediction_model = create_model(params_representation, False, True)
             image_encoder_actor, reward_prediction_model = create_model(params_representation, False, True)
@@ -341,19 +348,19 @@ if __name__ == '__main__':
     )
 
     if params['is_oracle_setup'] == True:
-        env = SpritesStateEnv()
+        env = SpritesStateEnv(follow=True, n_distractors = params['distractor'])
         state_dim = env.observation_space.shape[0]
     else:
-        env = SpritesEnv()
+        env = SpritesEnv(follow=True, n_distractors = params['distractor'])
         state_dim = 128 # with CNN, we get 1x64x64 -> 4x32x32 -> ... -> 128 x 1 x 1 latent variable. I will flatten and put in.
     env.set_config(data_spec)
 
     action_dim = env.action_space.shape[0]
-    actor = Actor(state_dim, action_dim)
-    qf1 = SoftQNetwork(state_dim, action_dim)
-    qf2 = SoftQNetwork(state_dim, action_dim)
-    qf1_target = SoftQNetwork(state_dim, action_dim)
-    qf2_target = SoftQNetwork(state_dim, action_dim)
+    actor = Actor(state_dim, action_dim).to(device)
+    qf1 = SoftQNetwork(state_dim, action_dim).to(device)
+    qf2 = SoftQNetwork(state_dim, action_dim).to(device)
+    qf1_target = SoftQNetwork(state_dim, action_dim).to(device)
+    qf2_target = SoftQNetwork(state_dim, action_dim).to(device)
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
 
@@ -367,7 +374,8 @@ if __name__ == '__main__':
     replay_buffer = collections.deque(maxlen=1000000)
 
     target_entropy = -torch.prod(torch.Tensor(env.observation_space.shape)).item()
-    log_alpha = torch.zeros(1, requires_grad=True)
+    log_alpha = torch.zeros(1).to(device)
+    log_alpha.requires_grad = True
     alpha = log_alpha.exp().item()
     a_optimizer = optim.Adam([log_alpha], lr=3e-4)
 
@@ -378,9 +386,9 @@ if __name__ == '__main__':
         total_reward = 0
         while not termination:
             if params['is_oracle_setup'] == True:
-                obs_tensor = torch.Tensor(obs)
+                obs_tensor = torch.Tensor(obs).to(device)
             else:
-                obs_tensor = image_encoder_actor(torch.from_numpy(obs.astype(np.float32)).unsqueeze(0).unsqueeze(0))[0].flatten()
+                obs_tensor = image_encoder_actor(torch.from_numpy(obs.astype(np.float32)).to(device).unsqueeze(0).unsqueeze(0))[0].flatten()
             action, _, _ = actor.get_action(obs_tensor)
             #action = torch.Tensor(env.action_space.sample())
 
@@ -393,11 +401,11 @@ if __name__ == '__main__':
                 if params['is_oracle_setup'] == True:
                     minibatch = random.sample(replay_buffer, params['batch_size'])
                     rb_obs, rb_next_obs, rb_actions, rb_rewards, rb_terminations, rb_infos = zip(*minibatch)
-                    rb_obs_tensor = torch.Tensor(rb_obs)
-                    rb_next_obs_tensor = torch.Tensor(rb_next_obs)
-                    rb_actions_tensor = torch.Tensor(rb_actions)
-                    rb_rewards_tensor = torch.Tensor(rb_rewards)
-                    rb_terminations_tensor = torch.Tensor(rb_terminations)
+                    rb_obs_tensor = torch.Tensor(rb_obs).to(device)
+                    rb_next_obs_tensor = torch.Tensor(rb_next_obs).to(device)
+                    rb_actions_tensor = torch.Tensor(rb_actions).to(device)
+                    rb_rewards_tensor = torch.Tensor(rb_rewards).to(device)
+                    rb_terminations_tensor = torch.Tensor(rb_terminations).to(device)
                     with torch.no_grad():
                         next_state_actions, next_state_log_pis, _ = actor.get_action(rb_next_obs_tensor)
                         qf1_next_target = qf1_target(rb_next_obs_tensor, next_state_actions)
@@ -442,13 +450,13 @@ if __name__ == '__main__':
                     minibatch = random.sample(replay_buffer, params['batch_size'])
                     rb_obs, rb_next_obs, rb_actions, rb_rewards, rb_terminations, rb_infos = zip(*minibatch)
 
-                    rb_actions_tensor = torch.Tensor(rb_actions)
-                    rb_rewards_tensor = torch.Tensor(rb_rewards)
-                    rb_terminations_tensor = torch.Tensor(rb_terminations)
+                    rb_actions_tensor = torch.Tensor(rb_actions).to(device)
+                    rb_rewards_tensor = torch.Tensor(rb_rewards).to(device)
+                    rb_terminations_tensor = torch.Tensor(rb_terminations).to(device)
 
-                    rb_obs_critic_encoded_tensor = image_encoder_critic(torch.Tensor(rb_obs).unsqueeze(1))[0].squeeze()
-                    rb_next_obs_critic_encoded_tensor = image_encoder_critic(torch.Tensor(rb_next_obs).unsqueeze(1))[0].squeeze()
-                    rb_next_obs_actor_encoded_tensor = image_encoder_actor(torch.Tensor(rb_next_obs).unsqueeze(1))[0].squeeze()
+                    rb_obs_critic_encoded_tensor = image_encoder_critic(torch.Tensor(rb_obs).to(device).unsqueeze(1))[0].squeeze()
+                    rb_next_obs_critic_encoded_tensor = image_encoder_critic(torch.Tensor(rb_next_obs).to(device).unsqueeze(1))[0].squeeze()
+                    rb_next_obs_actor_encoded_tensor = image_encoder_actor(torch.Tensor(rb_next_obs).to(device).unsqueeze(1))[0].squeeze()
                     with torch.no_grad():
                         next_state_actions, next_state_log_pis, _ = actor.get_action(rb_next_obs_actor_encoded_tensor)
                         qf1_next_target = qf1_target(rb_next_obs_critic_encoded_tensor, next_state_actions)
@@ -466,8 +474,8 @@ if __name__ == '__main__':
                     qf_loss.backward()
                     q_optimizer.step()
 
-                    rb_obs_critic_encoded_tensor = image_encoder_critic(torch.Tensor(rb_obs).unsqueeze(1))[0].squeeze()
-                    rb_obs_actor_encoded_tensor = image_encoder_actor(torch.Tensor(rb_obs).unsqueeze(1))[0].squeeze()
+                    rb_obs_critic_encoded_tensor = image_encoder_critic(torch.Tensor(rb_obs).to(device).unsqueeze(1))[0].squeeze()
+                    rb_obs_actor_encoded_tensor = image_encoder_actor(torch.Tensor(rb_obs).to(device).unsqueeze(1))[0].squeeze()
                     pi, log_pi, _ = actor.get_action(rb_obs_actor_encoded_tensor)
                     qf1_pi = qf1(rb_obs_critic_encoded_tensor, pi)
                     qf2_pi = qf2(rb_obs_critic_encoded_tensor, pi)
@@ -493,7 +501,7 @@ if __name__ == '__main__':
 
                 log({'qf_loss': qf_loss})
                 log({'actor_loss': actor_loss})
-                q_target_value_log = float(next_q_value.numpy()[0])
+                q_target_value_log = float(next_q_value.cpu().numpy()[0])
                 log({'min_q_value': q_target_value_log})
                 log({'alpha': alpha})
                 log({'alpha_loss': alpha_loss})
