@@ -10,8 +10,6 @@ import wandb
 from src.general_utils import make_image_seq_strip
 from src.sprites_env.envs.sprites import SpritesEnv, SpritesStateEnv
 import random
-from dataclasses import dataclass
-import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
@@ -123,9 +121,9 @@ def generate_dataset_spec(params):
     return moving_sprites.AttrDict(
         resolution=params['resolution'],
         max_seq_len=params['trajectory_length'],
-        max_speed=0.05,      # total image range [0, 1]
+        max_speed=params['max_speed'],      # total image range [0, 1]
         obj_size=0.2,       # size of objects, full images is 1.0
-        shapes_per_traj=3,      # number of shapes per trajectory
+        shapes_per_traj=2,      # number of shapes per trajectory
         rewards=rewards,
     )
 
@@ -294,23 +292,29 @@ class Actor(nn.Module):
         return action, log_prob, mean
 
 if __name__ == '__main__':
+    # for changing 0 distractor to 1 distractor or vice versa
+    # change generate_dataset_spec, shapes per traj = 3 (when training representation). currently have 3 so no need!
+    # change sprites.py self.n_distractors = kwarg['n_distractors'] if kwarg else 1 part to 0.
     params = {
         'is_oracle_setup': False,
-        'use_representation': True,
+        'image_scratch': True,
         'batch_size': 32,
-        'num_episodes': 10000,
+        'num_episodes': 100000,
         'seed': 1,
         'tau': 0.05,
         'gamma': 0.9,
         'q_lr': 1e-3,
         'actor_lr': 1e-3,
+        'env_ep_length' : 50,
+        'env_max_speed' : 0.1,
     }
 
-    if params['use_representation'] == True:
+    if params['is_oracle_setup'] == False:
         params_representation = {
             'batch_size': 256,
-            'version_name': 'one_distractor',
-            'trajectory_length': 50,
+            'version_name': 'zero_distractor',
+            'trajectory_length': params['env_ep_length'],
+            'max_speed': params['env_max_speed'],
             'prior_count': 3,
             'reward_prediction_count': 25,
             'image_latent_dimension': 64,
@@ -319,16 +323,19 @@ if __name__ == '__main__':
             'training_save_index': 50,
             'training_finishing_index': 10000,
         }
-        version_name = params_representation['version_name']
-        print(params_representation['version_name'])
-        image_encoder, reward_prediction_model = create_model(params_representation, True, True)
-        #image_decoder = create_image_decoder_representation(image_encoder, params, True, False)
+        if params['image_scratch'] == True:
+            image_encoder_critic = ImageEncoder(1, params_representation['resolution'], params_representation['image_latent_dimension'])
+            image_encoder_actor = ImageEncoder(1, params_representation['resolution'], params_representation['image_latent_dimension'])
+        else:
+            image_encoder_critic, reward_prediction_model = create_model(params_representation, False, True)
+            image_encoder_actor, reward_prediction_model = create_model(params_representation, False, True)
+            #image_decoder = create_image_decoder_representation(image_encoder, params, True, False)
     
     #learning representation now
     data_spec = moving_sprites.AttrDict(
         resolution=64,
-        max_ep_len=40,
-        max_speed=0.1,      # total image range [0, 1]
+        max_ep_len=params['env_ep_length'],
+        max_speed=params['env_max_speed'],      # total image range [0, 1]
         obj_size=0.2,       # size of objects, full images is 1.0
         follow=True,
     )
@@ -349,8 +356,14 @@ if __name__ == '__main__':
     qf2_target = SoftQNetwork(state_dim, action_dim)
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
-    q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=params['q_lr'])
-    actor_optimizer = optim.Adam(list(actor.parameters()), lr=params['actor_lr'])
+
+    if params['is_oracle_setup'] == True:
+        q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=params['q_lr'])
+        actor_optimizer = optim.Adam(list(actor.parameters()), lr=params['actor_lr'])
+    else:
+        q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()) + list(image_encoder_critic.parameters()), lr=params['q_lr'])
+        actor_optimizer = optim.Adam(list(actor.parameters()) + list(image_encoder_actor.parameters()), lr=params['actor_lr'])
+
     replay_buffer = collections.deque(maxlen=1000000)
 
     target_entropy = -torch.prod(torch.Tensor(env.observation_space.shape)).item()
@@ -360,10 +373,15 @@ if __name__ == '__main__':
 
     for episode in range(params['num_episodes']):
         obs = env.reset()
+        #comes in as 64x64 grayscale image. change to 1x1x64x64 for encoding.
         termination = False
         total_reward = 0
         while not termination:
-            action, _, _ = actor.get_action(torch.Tensor(obs))
+            if params['is_oracle_setup'] == True:
+                obs_tensor = torch.Tensor(obs)
+            else:
+                obs_tensor = image_encoder_actor(torch.from_numpy(obs.astype(np.float32)).unsqueeze(0).unsqueeze(0))[0].flatten()
+            action, _, _ = actor.get_action(obs_tensor)
             #action = torch.Tensor(env.action_space.sample())
 
             action = action.detach().cpu().numpy()
@@ -372,53 +390,106 @@ if __name__ == '__main__':
             replay_buffer.append((obs, real_next_obs, action, reward, termination, info))
 
             if len(replay_buffer) > params['batch_size']:
-                minibatch = random.sample(replay_buffer, params['batch_size'])
-                rb_obs, rb_next_obs, rb_actions, rb_rewards, rb_terminations, rb_infos = zip(*minibatch)
-                rb_obs_tensor = torch.Tensor(rb_obs)
-                rb_next_obs_tensor = torch.Tensor(rb_next_obs)
-                rb_actions_tensor = torch.Tensor(rb_actions)
-                rb_rewards_tensor = torch.Tensor(rb_rewards)
-                rb_terminations_tensor = torch.Tensor(rb_terminations)
-                with torch.no_grad():
-                    next_state_actions, next_state_log_pis, _ = actor.get_action(rb_next_obs_tensor)
-                    qf1_next_target = qf1_target(rb_next_obs_tensor, next_state_actions)
-                    qf2_next_target = qf2_target(rb_next_obs_tensor, next_state_actions)
-                    min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pis
-                    next_q_value = rb_rewards_tensor.flatten() + (1 - rb_terminations_tensor.flatten()) * params['gamma'] * (min_qf_next_target).view(-1)
+                if params['is_oracle_setup'] == True:
+                    minibatch = random.sample(replay_buffer, params['batch_size'])
+                    rb_obs, rb_next_obs, rb_actions, rb_rewards, rb_terminations, rb_infos = zip(*minibatch)
+                    rb_obs_tensor = torch.Tensor(rb_obs)
+                    rb_next_obs_tensor = torch.Tensor(rb_next_obs)
+                    rb_actions_tensor = torch.Tensor(rb_actions)
+                    rb_rewards_tensor = torch.Tensor(rb_rewards)
+                    rb_terminations_tensor = torch.Tensor(rb_terminations)
+                    with torch.no_grad():
+                        next_state_actions, next_state_log_pis, _ = actor.get_action(rb_next_obs_tensor)
+                        qf1_next_target = qf1_target(rb_next_obs_tensor, next_state_actions)
+                        qf2_next_target = qf2_target(rb_next_obs_tensor, next_state_actions)
+                        min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pis
+                        next_q_value = rb_rewards_tensor.flatten() + (1 - rb_terminations_tensor.flatten()) * params['gamma'] * (min_qf_next_target).view(-1)
 
-                qf1_a_values = qf1(rb_obs_tensor, rb_actions_tensor).view(-1)
-                qf2_a_values = qf2(rb_obs_tensor, rb_actions_tensor).view(-1)
-                qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
-                qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
-                qf_loss = qf1_loss + qf2_loss
+                    qf1_a_values = qf1(rb_obs_tensor, rb_actions_tensor).view(-1)
+                    qf2_a_values = qf2(rb_obs_tensor, rb_actions_tensor).view(-1)
+                    qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
+                    qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
+                    qf_loss = qf1_loss + qf2_loss
 
-                # optimize the model
-                q_optimizer.zero_grad()
-                qf_loss.backward()
-                q_optimizer.step()
+                    # optimize the model
+                    q_optimizer.zero_grad()
+                    qf_loss.backward()
+                    q_optimizer.step()
 
-                pi, log_pi, _ = actor.get_action(rb_obs_tensor)
-                qf1_pi = qf1(rb_obs_tensor, pi)
-                qf2_pi = qf2(rb_obs_tensor, pi)
-                min_qf_pi = torch.min(qf1_pi, qf2_pi)
-                actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
+                    pi, log_pi, _ = actor.get_action(rb_obs_tensor)
+                    qf1_pi = qf1(rb_obs_tensor, pi)
+                    qf2_pi = qf2(rb_obs_tensor, pi)
+                    min_qf_pi = torch.min(qf1_pi, qf2_pi)
+                    actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
 
-                actor_optimizer.zero_grad()
-                actor_loss.backward()
-                actor_optimizer.step()
+                    actor_optimizer.zero_grad()
+                    actor_loss.backward()
+                    actor_optimizer.step()
 
-                for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
-                    target_param.data.copy_(params['tau'] * param.data + (1 - params['tau']) * target_param.data)
-                for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
-                    target_param.data.copy_(params['tau'] * param.data + (1 - params['tau']) * target_param.data)
+                    for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
+                        target_param.data.copy_(params['tau'] * param.data + (1 - params['tau']) * target_param.data)
+                    for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
+                        target_param.data.copy_(params['tau'] * param.data + (1 - params['tau']) * target_param.data)
 
-                with torch.no_grad():
-                    _, log_pi, _ = actor.get_action(rb_obs_tensor)
-                alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
-                a_optimizer.zero_grad()
-                alpha_loss.backward()
-                a_optimizer.step()
-                alpha = log_alpha.exp().item()
+                    with torch.no_grad():
+                        _, log_pi, _ = actor.get_action(rb_obs_tensor)
+                    alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
+                    a_optimizer.zero_grad()
+                    alpha_loss.backward()
+                    a_optimizer.step()
+                    alpha = log_alpha.exp().item()
+                else:
+                    minibatch = random.sample(replay_buffer, params['batch_size'])
+                    rb_obs, rb_next_obs, rb_actions, rb_rewards, rb_terminations, rb_infos = zip(*minibatch)
+
+                    rb_actions_tensor = torch.Tensor(rb_actions)
+                    rb_rewards_tensor = torch.Tensor(rb_rewards)
+                    rb_terminations_tensor = torch.Tensor(rb_terminations)
+
+                    rb_obs_critic_encoded_tensor = image_encoder_critic(torch.Tensor(rb_obs).unsqueeze(1))[0].squeeze()
+                    rb_next_obs_critic_encoded_tensor = image_encoder_critic(torch.Tensor(rb_next_obs).unsqueeze(1))[0].squeeze()
+                    rb_next_obs_actor_encoded_tensor = image_encoder_actor(torch.Tensor(rb_next_obs).unsqueeze(1))[0].squeeze()
+                    with torch.no_grad():
+                        next_state_actions, next_state_log_pis, _ = actor.get_action(rb_next_obs_actor_encoded_tensor)
+                        qf1_next_target = qf1_target(rb_next_obs_critic_encoded_tensor, next_state_actions)
+                        qf2_next_target = qf2_target(rb_next_obs_critic_encoded_tensor, next_state_actions)
+                        min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pis
+                        next_q_value = rb_rewards_tensor.flatten() + (1 - rb_terminations_tensor.flatten()) * params['gamma'] * (min_qf_next_target).view(-1)
+
+                    qf1_a_values = qf1(rb_obs_critic_encoded_tensor, rb_actions_tensor).view(-1)
+                    qf2_a_values = qf2(rb_obs_critic_encoded_tensor, rb_actions_tensor).view(-1)
+                    qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
+                    qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
+                    qf_loss = qf1_loss + qf2_loss
+
+                    q_optimizer.zero_grad()
+                    qf_loss.backward()
+                    q_optimizer.step()
+
+                    rb_obs_critic_encoded_tensor = image_encoder_critic(torch.Tensor(rb_obs).unsqueeze(1))[0].squeeze()
+                    rb_obs_actor_encoded_tensor = image_encoder_actor(torch.Tensor(rb_obs).unsqueeze(1))[0].squeeze()
+                    pi, log_pi, _ = actor.get_action(rb_obs_actor_encoded_tensor)
+                    qf1_pi = qf1(rb_obs_critic_encoded_tensor, pi)
+                    qf2_pi = qf2(rb_obs_critic_encoded_tensor, pi)
+                    min_qf_pi = torch.min(qf1_pi, qf2_pi)
+                    actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
+
+                    actor_optimizer.zero_grad()
+                    actor_loss.backward()
+                    actor_optimizer.step()
+
+                    for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
+                        target_param.data.copy_(params['tau'] * param.data + (1 - params['tau']) * target_param.data)
+                    for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
+                        target_param.data.copy_(params['tau'] * param.data + (1 - params['tau']) * target_param.data)
+
+                    with torch.no_grad():
+                        _, log_pi, _ = actor.get_action(rb_obs_actor_encoded_tensor)
+                    alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
+                    a_optimizer.zero_grad()
+                    alpha_loss.backward()
+                    a_optimizer.step()
+                    alpha = log_alpha.exp().item()
 
                 log({'qf_loss': qf_loss})
                 log({'actor_loss': actor_loss})
