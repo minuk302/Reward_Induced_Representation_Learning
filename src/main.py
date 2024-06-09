@@ -242,9 +242,9 @@ LOG_STD_MIN = -5
 class SoftQNetwork(nn.Module):
     def __init__(self, state_dim, action_dim):
         super().__init__()
-        self.fc1 = nn.Linear(state_dim + action_dim, 256)
-        self.fc2 = nn.Linear(256, 256)
-        self.fc3 = nn.Linear(256, 1)
+        self.fc1 = nn.Linear(state_dim + action_dim, 32)
+        self.fc2 = nn.Linear(32, 32)
+        self.fc3 = nn.Linear(32, 1)
 
     def forward(self, x, a):
         x = torch.cat([x, a], 1)
@@ -256,10 +256,10 @@ class SoftQNetwork(nn.Module):
 class Actor(nn.Module):
     def __init__(self, state_dim, action_dim):
         super().__init__()
-        self.fc1 = nn.Linear(state_dim, 256)
-        self.fc2 = nn.Linear(256, 256)
-        self.fc_mean = nn.Linear(256, action_dim)
-        self.fc_logstd = nn.Linear(256, action_dim)
+        self.fc1 = nn.Linear(state_dim, 32)
+        self.fc2 = nn.Linear(32, 32)
+        self.fc_mean = nn.Linear(32, action_dim)
+        self.fc_logstd = nn.Linear(32, action_dim)
         # action rescaling
         self.register_buffer(
             "action_scale", torch.tensor(((1.0) - (-1.0)) / 2.0, dtype=torch.float32)
@@ -312,20 +312,20 @@ if __name__ == '__main__':
 
     params = {
         'is_oracle_setup': False,
-        'image_scratch': False,
-        'batch_size': 64,
+        'image_scratch': True,
+        'batch_size': 32,
         'num_episodes': 1000000,
         'seed': 1,
-        'tau': 0.005,
-        'update_frequency': 4,
-        'target_network_frequency': 1,
+        'tau': 0.01,
+        'update_frequency': 2,
+        'target_network_frequency': 2,
         'gamma': 0.99,
-        'q_lr': 3e-4,
-        'actor_lr': 3e-4,
+        'q_lr': 1e-3,
+        'actor_lr': 1e-3,
         'env_ep_length' : 40,
         'env_max_speed' : 0.05,
         'distractor': 0,
-        'start_steps': 10000,
+        'start_steps': 4000,
     }
 
     print (f"is_oracle_setup: {params['is_oracle_setup']}")
@@ -374,7 +374,7 @@ if __name__ == '__main__':
         state_dim = env.observation_space.shape[0]
     else:
         env = SpritesEnv(follow=True, n_distractors = params['distractor'])
-        state_dim = 128 # with CNN, we get 1x64x64 -> 4x32x32 -> ... -> 128 x 1 x 1 latent variable. I will flatten and put in.
+        state_dim = 64 # with CNN, we get 1x64x64 -> 4x32x32 -> ... -> 128 x 1 x 1 latent variable. I will flatten and put in.
     env.set_config(data_spec)
 
     action_dim = env.action_space.shape[0]
@@ -476,14 +476,14 @@ if __name__ == '__main__':
                     rb_next_obs_tensor = torch.Tensor(rb_next_obs).to(device)
 
                     with torch.no_grad():
-                        next_state_actions, next_state_log_pis, _ = actor.get_action(image_encoder_actor(rb_next_obs_tensor.unsqueeze(1))[0].squeeze())
-                        qf1_next_target = qf1_target(image_encoder_critic(rb_next_obs_tensor.unsqueeze(1))[0].squeeze(), next_state_actions)
-                        qf2_next_target = qf2_target(image_encoder_critic(rb_next_obs_tensor.unsqueeze(1))[0].squeeze(), next_state_actions)
+                        next_state_actions, next_state_log_pis, _ = actor.get_action(image_encoder_actor(rb_next_obs_tensor.unsqueeze(1))[1].squeeze())
+                        qf1_next_target = qf1_target(image_encoder_critic(rb_next_obs_tensor.unsqueeze(1))[1].squeeze(), next_state_actions)
+                        qf2_next_target = qf2_target(image_encoder_critic(rb_next_obs_tensor.unsqueeze(1))[1].squeeze(), next_state_actions)
                         min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pis
                         next_q_value = rb_rewards_tensor.flatten() + (1 - rb_terminations_tensor.flatten()) * params['gamma'] * (min_qf_next_target).view(-1)
 
-                    qf1_a_values = qf1(image_encoder_critic(rb_obs_tensor.unsqueeze(1))[0].squeeze(), rb_actions_tensor).view(-1)
-                    qf2_a_values = qf2(image_encoder_critic(rb_obs_tensor.unsqueeze(1))[0].squeeze(), rb_actions_tensor).view(-1)
+                    qf1_a_values = qf1(image_encoder_critic(rb_obs_tensor.unsqueeze(1))[1].squeeze(), rb_actions_tensor).view(-1)
+                    qf2_a_values = qf2(image_encoder_critic(rb_obs_tensor.unsqueeze(1))[1].squeeze(), rb_actions_tensor).view(-1)
                     qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
                     qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
                     qf_loss = qf1_loss + qf2_loss
@@ -492,9 +492,9 @@ if __name__ == '__main__':
                     qf_loss.backward()
                     q_optimizer.step()
 
-                    pi, log_pi, _ = actor.get_action(image_encoder_actor(rb_obs_tensor.unsqueeze(1))[0].squeeze())
-                    qf1_pi = qf1(image_encoder_critic(rb_obs_tensor.unsqueeze(1))[0].squeeze(), pi)
-                    qf2_pi = qf2(image_encoder_critic(rb_obs_tensor.unsqueeze(1))[0].squeeze(), pi)
+                    pi, log_pi, _ = actor.get_action(image_encoder_actor(rb_obs_tensor.unsqueeze(1))[1].squeeze())
+                    qf1_pi = qf1(image_encoder_critic(rb_obs_tensor.unsqueeze(1))[1].squeeze(), pi)
+                    qf2_pi = qf2(image_encoder_critic(rb_obs_tensor.unsqueeze(1))[1].squeeze(), pi)
                     min_qf_pi = torch.min(qf1_pi, qf2_pi)
                     actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
 
@@ -504,7 +504,7 @@ if __name__ == '__main__':
 
 
                     with torch.no_grad():
-                        _, log_pi, _ = actor.get_action(image_encoder_actor(rb_obs_tensor.unsqueeze(1))[0].squeeze())
+                        _, log_pi, _ = actor.get_action(image_encoder_actor(rb_obs_tensor.unsqueeze(1))[1].squeeze())
                     alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
                     a_optimizer.zero_grad()
                     alpha_loss.backward()
