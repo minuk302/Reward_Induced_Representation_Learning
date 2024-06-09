@@ -47,7 +47,7 @@ class ImageEncoder(torch.nn.Module):
     def forward(self, x):
         for layer in self.conv_layers:
             x = torch.nn.functional.relu(layer(x))
-        image_encode = x.clone()
+        image_encode = x
         x = x.view(x.size(0), -1)
         x = self.fc_layer(x)
         return image_encode, x
@@ -134,7 +134,7 @@ def generate_dataloader(params):
         dataset,
         batch_size=params['batch_size'],
         shuffle=False,
-        num_workers=16,
+        num_workers=8,
         drop_last=True,
     )
 
@@ -293,38 +293,45 @@ class Actor(nn.Module):
         return action, log_prob, mean
 
 if __name__ == '__main__':
-    # for changing 0 distractor to 1 distractor or vice versa
-    # change generate_dataset_spec, shapes per traj = 3 (when training representation). currently have 3 so no need!
-    # change sprites.py self.n_distractors = kwarg['n_distractors'] if kwarg else 1 part to 0.
-    params = {
-        'is_oracle_setup': True,
-        'image_scratch': False,
-        'batch_size': 32,
-        'num_episodes': 100000,
-        'seed': 1,
-        'tau': 0.05,
-        'gamma': 0.9,
-        'q_lr': 1e-3,
-        'actor_lr': 1e-3,
-        'env_ep_length' : 50,
-        'env_max_speed' : 0.1,
-        'distractor': 0,
-    }
-
     # params = {
-    #     'is_oracle_setup': False,
+    #     'is_oracle_setup': True,
     #     'image_scratch': False,
-    #     'batch_size': 256,
-    #     'num_episodes': 100000,
+    #     'batch_size': 32,
+    #     'num_episodes': 1000000,
     #     'seed': 1,
     #     'tau': 0.05,
+    #     'update_frequency': 1,
+    #     'target_network_frequency': 1,
     #     'gamma': 0.95,
-    #     'q_lr': 3e-4,
-    #     'actor_lr': 3e-4,
-    #     'env_ep_length' : 50,
-    #     'env_max_speed' : 0.1,
+    #     'q_lr': 1e-3,
+    #     'actor_lr': 1e-3,
+    #     'env_ep_length' : 40,
+    #     'env_max_speed' : 0.05,
     #     'distractor': 0,
     # }
+
+    params = {
+        'is_oracle_setup': False,
+        'image_scratch': False,
+        'batch_size': 64,
+        'num_episodes': 1000000,
+        'seed': 1,
+        'tau': 0.005,
+        'update_frequency': 4,
+        'target_network_frequency': 1,
+        'gamma': 0.99,
+        'q_lr': 3e-4,
+        'actor_lr': 3e-4,
+        'env_ep_length' : 40,
+        'env_max_speed' : 0.05,
+        'distractor': 0,
+        'start_steps': 10000,
+    }
+
+    print (f"is_oracle_setup: {params['is_oracle_setup']}")
+    print(f"distractor: {params['distractor']}")
+    print(f"image_scratch: {params['image_scratch']}")
+    print(f"batch_size: {params['batch_size']}")
 
     if params['distractor'] == 0:
         version_name = 'zero_distractor'
@@ -388,12 +395,13 @@ if __name__ == '__main__':
 
     replay_buffer = collections.deque(maxlen=1000000)
 
-    target_entropy = -torch.prod(torch.Tensor(env.observation_space.shape)).item()
+    target_entropy = -action_dim
     log_alpha = torch.zeros(1).to(device)
     log_alpha.requires_grad = True
     alpha = log_alpha.exp().item()
     a_optimizer = optim.Adam([log_alpha], lr=3e-4)
 
+    global_step = 0
     for episode in range(params['num_episodes']):
         obs = env.reset()
         #comes in as 64x64 grayscale image. change to 1x1x64x64 for encoding.
@@ -409,10 +417,11 @@ if __name__ == '__main__':
 
             action = action.detach().cpu().numpy()
             next_obs, reward, termination, info = env.step(action)
+            global_step += 1
             real_next_obs = next_obs.copy()
             replay_buffer.append((obs, real_next_obs, action, reward, termination, info))
 
-            if len(replay_buffer) > params['batch_size']:
+            if global_step > params['start_steps'] and len(replay_buffer) > params['batch_size'] and global_step % params['update_frequency'] == 0:
                 if params['is_oracle_setup'] == True:
                     minibatch = random.sample(replay_buffer, params['batch_size'])
                     rb_obs, rb_next_obs, rb_actions, rb_rewards, rb_terminations, rb_infos = zip(*minibatch)
@@ -448,11 +457,6 @@ if __name__ == '__main__':
                     actor_optimizer.zero_grad()
                     actor_loss.backward()
                     actor_optimizer.step()
-
-                    for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
-                        target_param.data.copy_(params['tau'] * param.data + (1 - params['tau']) * target_param.data)
-                    for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
-                        target_param.data.copy_(params['tau'] * param.data + (1 - params['tau']) * target_param.data)
 
                     with torch.no_grad():
                         _, log_pi, _ = actor.get_action(rb_obs_tensor)
@@ -498,10 +502,6 @@ if __name__ == '__main__':
                     actor_loss.backward()
                     actor_optimizer.step()
 
-                    for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
-                        target_param.data.copy_(params['tau'] * param.data + (1 - params['tau']) * target_param.data)
-                    for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
-                        target_param.data.copy_(params['tau'] * param.data + (1 - params['tau']) * target_param.data)
 
                     with torch.no_grad():
                         _, log_pi, _ = actor.get_action(image_encoder_actor(rb_obs_tensor.unsqueeze(1))[0].squeeze())
@@ -510,6 +510,12 @@ if __name__ == '__main__':
                     alpha_loss.backward()
                     a_optimizer.step()
                     alpha = log_alpha.exp().item()
+
+                if global_step % params['target_network_frequency'] == 0:
+                    for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
+                        target_param.data.copy_(params['tau'] * param.data + (1 - params['tau']) * target_param.data)
+                    for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
+                        target_param.data.copy_(params['tau'] * param.data + (1 - params['tau']) * target_param.data)
 
                 log({'qf_loss': qf_loss})
                 log({'actor_loss': actor_loss})
